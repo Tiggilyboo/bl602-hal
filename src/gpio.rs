@@ -236,12 +236,13 @@ pub struct Spi;
 /// I2C pin mode (type state)
 pub struct I2c;
 
+/// ADC analog pin mode (type state)
+pub struct Adc;
+
 /// PWM mode (type state)
 pub struct Pwm<MODE> {
     _mode: PhantomData<MODE>,
 }
-
-pub struct Adc;
 
 #[doc(hidden)]
 pub trait UartPin<SIG> {}
