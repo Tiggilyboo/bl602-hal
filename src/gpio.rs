@@ -372,6 +372,12 @@ macro_rules! impl_glb {
                     self.into_pin_with_mode(8, false, false, true)
                 }
 
+                /// Configures the pin to operate as an ADC pin
+                pub fn into_adc(self) -> $Pini<Adc> {
+                    // 10 -> ADC_FUNC_ANALOG
+                    self.into_pin_with_mode(10, false, false, true)
+                }
+
                 paste::paste! {
                     #[inline]
                     fn into_pin_with_mode<T>(self, mode: u8, pu: bool, pd: bool, ie: bool) -> $Pini<T> {

@@ -23,9 +23,9 @@
 //   - XTAL driving PLL, sysclock frequencies of 48/80/120/160/192Mhz
 //   - UART using PLL if sysclock is using PLL
 
-use crate::delay::*;
+use crate::{pac, adc};
+use crate::{delay::*, adc::AdcClockType};
 use crate::gpio::ClkCfg;
-use crate::pac;
 use core::num::NonZeroU32;
 use embedded_hal::delay::blocking::DelayUs;
 use embedded_time::rate::{Extensions, Hertz};
@@ -34,6 +34,7 @@ use embedded_time::rate::{Extensions, Hertz};
 pub const RC32M: u32 = 32_000_000;
 /// UART peripheral clock frequency when PLL selected
 pub const UART_PLL_FREQ: u32 = 160_000_000;
+pub const ADC_FREQ: u32 = 96_000_000;
 
 #[derive(PartialEq, Copy, Clone)]
 #[repr(u32)]
@@ -53,6 +54,7 @@ pub struct Clocks {
     uart_clk: Hertz,
     spi_clk: Hertz,
     i2c_clk: Hertz,
+    adc_clk: Hertz,
     _xtal_freq: Option<Hertz>,
     pll_enable: bool,
 }
@@ -64,6 +66,7 @@ impl Clocks {
             uart_clk: Hertz(RC32M),
             spi_clk: Hertz(RC32M),
             i2c_clk: Hertz(RC32M),
+            adc_clk: Hertz(RC32M),
             _xtal_freq: None,
             pll_enable: false,
         }
@@ -87,6 +90,10 @@ impl Clocks {
 
     pub const fn i2c_clk(&self) -> Hertz {
         self.i2c_clk
+    }
+
+    pub const fn adc_clk(&self) -> Hertz {
+        self.adc_clk
     }
 }
 
@@ -115,6 +122,7 @@ pub struct Strict {
     target_i2c_clk: Option<NonZeroU32>,
     target_spi_clk: Option<NonZeroU32>,
     target_uart_clk: Option<NonZeroU32>,
+    target_adc_clk: Option<NonZeroU32>,
     pll_xtal_freq: Option<u32>,
     sysclk: SysclkFreq,
 }
@@ -126,6 +134,7 @@ impl Strict {
             target_i2c_clk: None,
             target_spi_clk: None,
             target_uart_clk: None,
+            target_adc_clk: None,
             pll_xtal_freq: None,
             sysclk: SysclkFreq::Rc32Mhz,
         }
@@ -154,6 +163,14 @@ impl Strict {
         let freq_hz = freq.into().0;
 
         self.target_uart_clk = NonZeroU32::new(freq_hz);
+
+        self
+    }
+
+    pub fn adc_clk(mut self, freq: impl Into<Hertz>) -> Self {
+        let freq_hz = freq.into().0;
+
+        self.target_adc_clk = NonZeroU32::new(freq_hz);
 
         self
     }
@@ -281,11 +298,43 @@ impl Strict {
             .clk_cfg3
             .modify(|_, w| unsafe { w.i2c_clk_en().set_bit().i2c_clk_div().bits(i2c_clk_div) });
 
+        // ADC Clock
+        let adc_clock = if let Some(adc_clk) = self.target_adc_clk {
+            // 12 = Normal Mode Freq, 1 = Mic Mode Freq
+            let adc_clk_src = ADC_FREQ / (128 * 24 * 12);
+            let adc_clk_div = {
+                let mut div = adc_clk_src / adc_clk;
+                if ((div + 1) * u32::from(adc_clk) - adc_clk_src) < (adc_clk_src - u32::from(adc_clk) * div) {
+                    div += 1;
+                }
+                if div > 64 {
+                    div = 64;
+                }
+                div as u8
+            };
+            unsafe { &*pac::GLB::ptr() }.gpadc_32m_src_ctrl.modify(|_, w| {
+                w.gpadc_32m_div_en().clear_bit()
+            });
+            unsafe { &*pac::GLB::ptr() }.gpadc_32m_src_ctrl.modify(|_, w| unsafe {
+                w.gpadc_32m_clk_div().bits(adc_clk_div - 1)
+                // 96M = false, X = true
+                 .gpadc_32m_clk_sel().bit(AdcClockType::Clk96M.into())
+            });
+            unsafe { &*pac::GLB::ptr() }.gpadc_32m_src_ctrl.modify(|_, w| {
+                w.gpadc_32m_div_en().set_bit()
+            });
+
+            adc_clk.into()
+        } else {
+            1000u32.into()
+        };
+
         Clocks {
             sysclk: Hertz(sysclk as u32),
             uart_clk: Hertz(uart_clk),
             spi_clk: Hertz(spi_clk),
             i2c_clk: Hertz(i2c_clk),
+            adc_clk: Hertz(adc_clock),
             _xtal_freq: Some(Hertz(pll_xtal_freq)),
             pll_enable: pll_enabled,
         }
