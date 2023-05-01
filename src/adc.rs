@@ -266,7 +266,7 @@ impl adc::nb::Channel<Adc1> for crate::gpio::Pin9<Adc> {
 impl adc::nb::Channel<Adc1> for crate::gpio::Pin10<Adc> {
     type ID = AdcChannel;
     fn channel(&self) -> Self::ID {
-        AdcChannel::Ch8 // CH8/9 ??
+        AdcChannel::Ch9 // CH8/9 ??
     }
 }
 impl adc::nb::Channel<Adc1> for crate::gpio::Pin11<Adc> {
@@ -414,7 +414,9 @@ impl Adc1
         self.set_fifo_config(self.fifo_threshold, true);
     }
 
-    pub fn deinit(&mut self) {}
+    pub fn deinit(&mut self) {
+        self.stop();
+    }
 
     // ADC_Scan_Channel_Config
     fn config_channels(&self, enable_continuous_dma: bool) {
@@ -512,9 +514,8 @@ impl Adc1
             peripherals.EF_CTRL.ef_if_ctrl_0.read()
               .ef_if_0_busy().bit_is_set()
         }
-        fn use_ahb_clk_0() {
+        fn use_ahb_clk_0(peripherals: &Peripherals) {
             let mut timeout: u32 = EF_CTRL_DFT_TIMEOUT_VAL;
-            let peripherals = get_peripherals();
 
             while is_ctrl_busy(&peripherals) {
                 timeout -= 1;
@@ -538,44 +539,71 @@ impl Adc1
             });
         }
 
-        use_ahb_clk_0();
-        
-        let peripherals = unsafe { pac::Peripherals::steal() };
-        {
-            let gain_trim_reg = peripherals.EF_DATA_0.ef_key_slot_5_w3.read().bits();
-            let adc_gain_coeff = (gain_trim_reg >> 1) & 0xfff;
-            let adc_gain_coeff_parity = (gain_trim_reg >> 13) & 0x01;
-            let adc_gain_coeff_en = (gain_trim_reg >> 14) & 0x01 != 0;
+        let peripherals = get_peripherals();
+        use_ahb_clk_0(&peripherals);
 
-            if adc_gain_coeff_en {
-                if adc_gain_coeff as u8 == get_trim_parity(adc_gain_coeff_parity, 12) {
-                    self.gain_coeff_enable = true; 
-                    self.gain_coefficient = adc_gain_coeff as u16;
+        let gain_trim_reg = peripherals.EF_DATA_0.ef_key_slot_5_w3.read().bits();
+        let adc_gain_coeff = (gain_trim_reg >> 1) & 0xfff;
+        let adc_gain_coeff_parity = (gain_trim_reg >> 13) & 0x01;
+        let adc_gain_coeff_en = (gain_trim_reg >> 14) & 0x01 != 0;
 
-                    let mut tmp = self.gain_coefficient;
-                    if tmp & 0x800 != 0 {
-                        tmp = !tmp;
-                        tmp += 1;
-                        tmp = tmp & 0xfff;
+        if adc_gain_coeff_en {
+            if adc_gain_coeff as u8 == get_trim_parity(adc_gain_coeff_parity, 12) {
+                self.gain_coeff_enable = true; 
+                self.gain_coefficient = adc_gain_coeff as u16;
 
-                        self.gain_coe = 1.0 + (tmp as f32 / 2048.0);
-                    } else {
-                        self.gain_coe = 1.0 - (tmp as f32 / 2048.0);
-                    }
+                let mut tmp = self.gain_coefficient;
+                if tmp & 0x800 != 0 {
+                    tmp = !tmp;
+                    tmp += 1;
+                    tmp = tmp & 0xfff;
+
+                    self.gain_coe = 1.0 + (tmp as f32 / 2048.0);
+                } else {
+                    self.gain_coe = 1.0 - (tmp as f32 / 2048.0);
                 }
             }
         }
     }
 
     pub fn start(&self) {
-        let aon = get_peripherals().AON;
-        aon.gpadc_reg_cmd.modify(|_,w| w.gpadc_conv_start().clear_bit());
-        dummy_wait();
-        aon.gpadc_reg_cmd.modify(|_,w| w.gpadc_conv_start().set_bit());
+        if self.fifo_enable_dma {
+            let dma = get_peripherals().DMA;
+
+            // disable DMA_INT_ALL
+            dma.dma_c1config.modify(|_,w| w.itc().set_bit().ie().set_bit());
+            dma.dma_c1control.modify(|_,w| w.i().clear_bit());
+
+            // enable DMA_INT_TCOMPLETED
+            dma.dma_c1config.modify(|_,w| w.itc().clear_bit());
+            dma.dma_c1control.modify(|_,w| w.i().set_bit());
+
+            // enable DMA_INT_ERR
+            dma.dma_c1config.modify(|_,w| w.ie().set_bit());
+        }
+        {
+            let aon = get_peripherals().AON;
+            aon.gpadc_reg_cmd.modify(|_,w| w.gpadc_conv_start().clear_bit());
+            dummy_wait();
+            aon.gpadc_reg_cmd.modify(|_,w| w.gpadc_conv_start().set_bit());
+        }
+
+        if self.fifo_enable_dma {
+            // Enable DMA
+            let dma = get_peripherals().DMA;
+            dma.dma_top_config.modify(|_,w| w.e().set_bit());
+            // DMA channel 1 = ADC_CHANNEL
+            dma.dma_c1config.modify(|_,w| w.e().set_bit());
+        }
     }
 
     pub fn stop(&self) {
         get_peripherals().AON.gpadc_reg_cmd.modify(|_,w| w.gpadc_conv_start().set_bit());
+
+        if self.fifo_enable_dma {
+            // DMA channel 1 = ADC_CHANNEL
+            get_peripherals().DMA.dma_top_config.modify(|_,w| w.e().clear_bit());
+        }
     }
 
     pub fn fifo_count(&self) -> u8 {
@@ -590,6 +618,7 @@ impl Adc1
         get_peripherals().GPIP.gpadc_config.read().gpadc_fifo_ne().bit() == false
     }
 
+    #[allow(unused)]
     pub fn dma_init(&mut self, sample_len: u32) {
         let mut ctx = AdcContext {
             channel_data: 0,
@@ -627,12 +656,7 @@ impl Adc1
                 // 1 = DMA_BURST_SIZE_1, 2 = 4, 3 = 8, 4 = 16
                 .sbsize().bits(1) 
                 .dbsize().bits(1)
-                /*
-                DMA_TRNS_WIDTH_8BITS = 0,                /*!< DMA transfer width:8 bits */
-                DMA_TRNS_WIDTH_16BITS,                   /*!< DMA transfer width:16 bits */
-                DMA_TRNS_WIDTH_32BITS,                   /*!< DMA transfer width:32 bits */
-                */
-                .swidth().bits(2u8)
+                .swidth().bits(2u8) // 0 = 8bit, 1 = 16, 32 = 2
                 .dwidth().bits(2u8)
                 .si().clear_bit()
                 .di().set_bit()
