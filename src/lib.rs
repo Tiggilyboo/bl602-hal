@@ -45,7 +45,6 @@ pub mod serial;
 pub mod spi;
 pub mod timer;
 pub mod watchdog;
-pub mod pwm;
 pub mod adc;
 
 /// HAL crate prelude
