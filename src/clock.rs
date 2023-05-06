@@ -301,6 +301,9 @@ impl Strict {
         // ADC Clock
         let adc_clock = if let Some(adc_clk) = self.target_adc_clk {
             // 12 = Normal Mode Freq, 1 = Mic Mode Freq
+            if u32::from(adc_clk) < 500 || u32::from(adc_clk) > 16000 {
+                panic!("Unreachable ADC_CLK")
+            } 
             let adc_clk_src = ADC_FREQ / (128 * 24 * 12);
             let adc_clk_div = {
                 let mut div = adc_clk_src / adc_clk;

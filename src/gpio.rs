@@ -236,6 +236,9 @@ pub struct Spi;
 /// I2C pin mode (type state)
 pub struct I2c;
 
+// ADC pin mode (type state)
+pub struct Adc;
+
 #[doc(hidden)]
 pub trait UartPin<SIG> {}
 

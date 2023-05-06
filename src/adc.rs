@@ -1,13 +1,9 @@
-use core::convert::Infallible;
 use core::mem::size_of;
 use core::ptr::null;
 
 use embedded_hal::adc::{self as adc, nb::OneShot, nb::Channel};
-use embedded_hal::delay::blocking::{DelayUs, DelayMs};
 use pac::Peripherals;
 use crate::clock;
-use crate::clock::Clocks;
-use crate::delay;
 use crate::delay::*;
 
 use crate::{pac, gpio::Adc};
@@ -344,7 +340,7 @@ impl Adc1
         }
     }
 
-    pub fn init(&mut self, clocks: &clock::Clocks) {
+    pub fn init(&mut self, clocks: &clock::Clocks, gain1: AdcPgaGain, gain2: AdcPgaGain) {
         self.sys_clock = clocks.sysclk().0;
 
         adc_enable(false);
@@ -370,44 +366,11 @@ impl Adc1
         McycleDelay::delay_cycles(8);
 
         // config2
-        {
-            let aon = unsafe { &*pac::AON::ptr() };
-            aon.gpadc_reg_config2.modify(|_, w| unsafe {
-                w.gpadc_dly_sel().bits(0u8);
-                w.gpadc_pga1_gain().bits(self.gain1 as u8);
-                w.gpadc_pga2_gain().bits(self.gain2 as u8);
-                w.gpadc_bias_sel().bit(self.bias_sel.into());
-
-                // chopmode
-                let has_gain = self.gain1 != AdcPgaGain::PgaGainNone || self.gain2 != AdcPgaGain::PgaGainNone;
-                if has_gain {
-                    w.gpadc_chop_mode().bits(2u8);
-                } else {
-                    w.gpadc_chop_mode().bits(1u8);
-                }
-                
-                // pga_vcmi = mic
-                w.gpadc_pga_vcmi_en().bit(false);
-                w.gpadc_pga_en().bit(has_gain);
-
-                // pga_os_cal = mic
-                w.gpadc_pga_os_cal().bits(8u8);
-                w.gpadc_pga_vcm().bits(self.vcm as u8);
-                w.gpadc_vref_sel().bit(self.vref.into());
-                w.gpadc_diff_mode().bit(self.input_mode.into());
-
-                w
-            });
-
-            // calibration offset
-            aon.gpadc_reg_define.modify(|_,w| unsafe {
-                w.gpadc_os_cal_data().bits(self.offset_calibration_value)
-            });
-        }
+        self.set_gain(gain1, gain2);
 
         self.set_gain_trim();
 
-        self.dma_init(1000);
+        self.dma_init(100);
 
         self.config_channels(true);
 
@@ -581,6 +544,7 @@ impl Adc1
             // enable DMA_INT_ERR
             dma.dma_c1config.modify(|_,w| w.ie().set_bit());
         }
+
         {
             let aon = get_peripherals().AON;
             aon.gpadc_reg_cmd.modify(|_,w| w.gpadc_conv_start().clear_bit());
@@ -590,6 +554,8 @@ impl Adc1
 
         if self.fifo_enable_dma {
             // Enable DMA
+            adc_enable(true);
+
             let dma = get_peripherals().DMA;
             dma.dma_top_config.modify(|_,w| w.e().set_bit());
             // DMA channel 1 = ADC_CHANNEL
@@ -618,7 +584,44 @@ impl Adc1
         get_peripherals().GPIP.gpadc_config.read().gpadc_fifo_ne().bit() == false
     }
 
-    #[allow(unused)]
+    pub fn set_gain(&mut self, gain1: AdcPgaGain, gain2: AdcPgaGain) {
+        let aon = unsafe { &*pac::AON::ptr() };
+        aon.gpadc_reg_config2.modify(|_, w| unsafe {
+            w.gpadc_dly_sel().bits(0u8);
+            w.gpadc_pga1_gain().bits(self.gain1 as u8);
+            w.gpadc_pga2_gain().bits(self.gain2 as u8);
+            w.gpadc_bias_sel().bit(self.bias_sel.into());
+
+            // chopmode
+            let has_gain = self.gain1 != AdcPgaGain::PgaGainNone || self.gain2 != AdcPgaGain::PgaGainNone;
+            if has_gain {
+                w.gpadc_chop_mode().bits(2u8);
+            } else {
+                w.gpadc_chop_mode().bits(1u8);
+            }
+            
+            // pga_vcmi = mic
+            w.gpadc_pga_vcmi_en().bit(false);
+            w.gpadc_pga_en().bit(has_gain);
+
+            // pga_os_cal = mic
+            w.gpadc_pga_os_cal().bits(8u8);
+            w.gpadc_pga_vcm().bits(self.vcm as u8);
+            w.gpadc_vref_sel().bit(self.vref.into());
+            w.gpadc_diff_mode().bit(self.input_mode.into());
+
+            w
+        });
+
+        // calibration offset
+        aon.gpadc_reg_define.modify(|_,w| unsafe {
+            w.gpadc_os_cal_data().bits(self.offset_calibration_value)
+        });
+
+        self.gain1 = gain1;
+        self.gain2 = gain2;
+    }
+
     pub fn dma_init(&mut self, sample_len: u32) {
         let mut ctx = AdcContext {
             channel_data: 0,
@@ -663,7 +666,16 @@ impl Adc1
                 .i().set_bit()
                 .prot().bits(0u8)
             });
+
+            // DMA_LLI_Update
+            {
+                let lli0_ptr = core::ptr::addr_of!(ctx.lli0) as u32;
+                dma.dma_c0lli.modify(|_,w| unsafe { w.lli().bits(lli0_ptr) });
+            }
         }
+
+        // bl_dma_irq_register
+
     }
 }
 
