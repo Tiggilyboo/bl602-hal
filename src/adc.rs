@@ -1,17 +1,19 @@
-use core::mem::size_of;
-use core::ptr::null;
 
 use embedded_hal::adc::{self as adc, nb::OneShot, nb::Channel};
 use pac::Peripherals;
 use crate::clock;
 use crate::delay::*;
-
-use crate::{pac, gpio::Adc};
+use crate::dma;
+use crate::dma::single_buffer;
+use crate::dma::single_channel::SingleChannel;
+use crate::gpio::AdcPin;
+use crate::pac;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AdcError {
     ErrFifoEmpty,
     ErrRead,
+    ErrInt,
 }
 
 #[repr(u8)]
@@ -181,141 +183,63 @@ pub enum AdcFifoThreshold {
     FifoThreshold8,
     FifoThreshold16,
 }
-#[repr(u8)]
-pub enum DmaTransferDir {
-    MemoryToMemory,
-    MemoryToPeripheral,
-    PeripheralToMemory,
-    PeripheralToPeripheral,
-}
 
 const EF_CTRL_DFT_TIMEOUT_VAL: u32 = 160 * 1000;
 const ADC_CHANNEL_COUNT: usize = 12;
-const ADC_DMA_BUF_SIZE: usize = 1000 * 2 * size_of::<u32>();
 
 // ADC_CFG_Type
-pub struct Adc1 {
-    sys_clock: u32,
-    v18_sel: AdcV18Sel,
-    v11_sel: AdcV11Sel,
-    clk_div: AdcClockDiv,
-    gain1: AdcPgaGain,
-    gain2: AdcPgaGain,
-    vref: AdcVRefType,
-    bias_sel: AdcBiasBandgap,
-    vcm: AdcPgaVcm,
-    input_mode: AdcInputMode,
-    data_width: AdcDataWidth,
-    offset_calibration: bool,
-    offset_calibration_value: u16,
+pub struct Config {
+    pub v18_sel: AdcV18Sel,
+    pub v11_sel: AdcV11Sel,
+    pub clk_div: AdcClockDiv,
+    pub gain1: AdcPgaGain,
+    pub gain2: AdcPgaGain,
+    pub vref: AdcVRefType,
+    pub bias_sel: AdcBiasBandgap,
+    pub vcm: AdcPgaVcm,
+    pub input_mode: AdcInputMode,
+    pub data_width: AdcDataWidth,
+    pub offset_calibration: bool,
+    pub offset_calibration_value: u16,
     pos_channels: [AdcChannel; ADC_CHANNEL_COUNT],
     neg_channels: [AdcChannel; ADC_CHANNEL_COUNT],
     scan_len: u8,
-    fifo_enable_dma: bool,
-    fifo_threshold: AdcFifoThreshold,
-    gain_coeff_enable: bool,
-    gain_coefficient: u16,
-    gain_coe: f32,
-    dma_ctx: Option<AdcContext>,
+    pub fifo_enable_dma: bool,
+    pub fifo_threshold: AdcFifoThreshold,
 }
 
-// adc_ctx_t
-struct AdcContext {
-    channel_data: u32,
-    chan_init_table: u32,
-    data_size: u32,
-    data_buf: [u8; ADC_DMA_BUF_SIZE],
-    lli0: DmaLliCtrl,
-    lli1: DmaLliCtrl,
+pub struct Adc {
+    gpip: pac::GPIP,
+    dma_ch: dma::Channel<dma::CH1>,
+    pub buf: [u16; 64],
 }
 
-struct DmaLliCtrl {
-    src_dma_addr: u32,
-    dst_dma_addr: *const u8,
-    next_lli: *const DmaLliCtrl,
-}
-
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin4<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch1
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin5<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch4
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin6<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch5
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin9<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch6 // 6/7??
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin10<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch9 // CH8/9 ??
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin11<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch10
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin12<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch0
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin13<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch3 // CH3
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin14<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch2
-    }
-}
-impl adc::nb::Channel<Adc1> for crate::gpio::Pin15<Adc> {
-    type ID = AdcChannel;
-    fn channel(&self) -> Self::ID {
-        AdcChannel::Ch11 // CH11
-    }
-}
-
-// 12 bit ADC
-impl Adc1
-{
-    pub fn new(adc_channel: AdcChannel) -> Self 
-    {
-        let mut scan_len = 0;
-        let mut neg_channels = [AdcChannel::None; ADC_CHANNEL_COUNT];
-        let mut pos_channels = [AdcChannel::None; ADC_CHANNEL_COUNT];
-
-        for i in 0..ADC_CHANNEL_COUNT {
-            let ch_at_i = AdcChannel::from(i as u8);
-            if adc_channel == ch_at_i {
-                pos_channels[i] = ch_at_i;
-                neg_channels[i] = AdcChannel::ChGnd;
-                scan_len += 1;
+macro_rules! impl_adc_pin {
+    ($Pini: ident, $ch: ident) => {
+        impl adc::nb::Channel<Adc> for crate::gpio::$Pini<crate::gpio::Adc> {
+            type ID = AdcChannel;
+            fn channel(&self) -> Self::ID {
+                AdcChannel::$ch
             }
         }
+    };
+}
 
+impl_adc_pin!(Pin4, Ch1);
+impl_adc_pin!(Pin5, Ch4);
+impl_adc_pin!(Pin6, Ch5);
+impl_adc_pin!(Pin9, Ch6);
+impl_adc_pin!(Pin10, Ch9);
+impl_adc_pin!(Pin11, Ch10);
+impl_adc_pin!(Pin12, Ch0);
+impl_adc_pin!(Pin13, Ch3);
+impl_adc_pin!(Pin14, Ch2);
+impl_adc_pin!(Pin15, Ch11);
+
+impl Default for Config {
+    fn default() -> Self 
+    {
         Self {
-            sys_clock: 0, // set on init()
             clk_div: AdcClockDiv::Div24,
             v18_sel: AdcV18Sel::Sel1p82v,
             v11_sel: AdcV11Sel::Sel1p1v,
@@ -330,51 +254,78 @@ impl Adc1
             offset_calibration_value: 0,
             fifo_enable_dma: false,
             fifo_threshold: AdcFifoThreshold::FifoThreshold1,
-            gain_coeff_enable: false,
-            gain_coefficient: 0,
-            gain_coe: 0f32,
-            pos_channels,
-            neg_channels,
-            scan_len,
-            dma_ctx: None,
+            pos_channels: [AdcChannel::None; ADC_CHANNEL_COUNT],
+            neg_channels: [AdcChannel::None; ADC_CHANNEL_COUNT],
+            scan_len: 0,
         }
     }
+}
 
-    pub fn init(&mut self, clocks: &clock::Clocks, gain1: AdcPgaGain, gain2: AdcPgaGain) {
-        self.sys_clock = clocks.sysclk().0;
+// 12 bit ADC
+impl Config {
+    pub fn use_channel(mut self, channel: AdcChannel) -> Self 
+    {
+        if self.scan_len + 1 > ADC_CHANNEL_COUNT as u8 {
+            panic!("Only 12 channels available")
+        }
+        self.pos_channels[self.scan_len as usize] = channel;
+        self.neg_channels[self.scan_len as usize] = AdcChannel::ChGnd;
+        self.scan_len += 1;
+        self
+    }
+}
 
+impl Adc {
+    pub fn new(aon: pac::AON, gpip: pac::GPIP, dma_ch: dma::Channel<dma::CH1>, config: Config, clocks: &clock::Clocks) -> Self {
         adc_enable(false);
         adc_enable(true);
         soft_reset();
 
         // config1
         {
-            let aon = unsafe { &*pac::AON::ptr() };
-            aon.gpadc_reg_config1.modify(|_,w| unsafe {
-                w.gpadc_v18_sel().bits(self.v18_sel as u8);
-                w.gpadc_v11_sel().bits(self.v11_sel as u8);
+            let dp = unsafe { Peripherals::steal() };
+            dp.AON.gpadc_reg_config1.modify(|_,w| unsafe {
+                w.gpadc_v18_sel().bits(config.v18_sel as u8);
+                w.gpadc_v11_sel().bits(config.v11_sel as u8);
                 w.gpadc_dither_en().bit(false);
                 w.gpadc_scan_en().bit(false);
                 w.gpadc_scan_length().bits(0u8);
-                w.gpadc_clk_div_ratio().bits(self.clk_div as u8);
+                w.gpadc_clk_div_ratio().bits(config.clk_div as u8);
                 w.gpadc_clk_ana_inv().bit(false);
-                w.gpadc_cal_os_en().bit(self.offset_calibration);
-                w.gpadc_res_sel().bits(self.data_width as u8);
+                w.gpadc_cal_os_en().bit(config.offset_calibration);
+                w.gpadc_res_sel().bits(config.data_width as u8);
                 w
             });
         }
         McycleDelay::delay_cycles(8);
 
         // config2
-        self.set_gain(gain1, gain2);
+        Self::set_gain(&config);
 
-        self.set_gain_trim();
+        let mut coef_enable = false;
+        let mut coef: u16 = 0;
+        let mut coe: f32 = 0f32;
+        Self::set_gain_trim(&mut coef_enable, &mut coef, &mut coe);
 
-        self.dma_init(100);
+        Self::config_channels(&aon, &config, false);
 
-        self.config_channels(true);
+        // ADC_FIFO_Cfg
+        // enable = Fifo data is exceeded fifoThreshold DMA request occurs
+        // disable = Threshold determines how much data to cause FIFO ready interrupt
+        gpip.gpadc_config.modify(|_,w| unsafe {
+            w.gpadc_fifo_thl().bits(config.fifo_threshold as u8)
+            .gpadc_dma_en().bit(config.fifo_enable_dma)
+        });
+        // clear fifo
+        gpip.gpadc_config.modify(|_,w| {
+            w.gpadc_fifo_clr().clear_bit()
+        });
 
-        self.set_fifo_config(self.fifo_threshold, true);
+        Self {
+            gpip,
+            dma_ch,
+            buf: [0u16; 64],
+        }
     }
 
     pub fn deinit(&mut self) {
@@ -382,8 +333,8 @@ impl Adc1
     }
 
     // ADC_Scan_Channel_Config
-    fn config_channels(&self, enable_continuous_dma: bool) {
-        let scan_len = self.scan_len as usize;
+    fn config_channels(aon: &pac::AON, config: &Config, enable_continuous_dma: bool) {
+        let scan_len = config.scan_len as usize;
 
         // mode != 0
         let deal_len = if scan_len < 6 {
@@ -393,75 +344,55 @@ impl Adc1
         };
 
         // set first 6 ch 
-        let peripherals = get_peripherals();
-        peripherals.AON.gpadc_reg_scn_pos1.modify(|r,w| unsafe {
+        aon.gpadc_reg_scn_pos1.modify(|r,w| unsafe {
             let mut reg = r.bits();
             for i in 0..deal_len {
                 reg = reg & (!(0x1F << (i * 5)));
                 // TODO: Multi channel
-                reg |= ((self.pos_channels[i] as u8) << (i * 5)) as u32;
+                reg |= ((config.pos_channels[i] as u8) << (i * 5)) as u32;
             }
             w.bits(reg)
         });
-        peripherals.AON.gpadc_reg_scn_neg1.modify(|r,w| unsafe {
+        aon.gpadc_reg_scn_neg1.modify(|r,w| unsafe {
             let mut reg = r.bits();
             for i in 0..deal_len {
                 reg = reg & (!(0x1F << (i * 5)));
                 // TODO: Multi channel
-                reg |= ((self.neg_channels[i] as u8) << (i * 5)) as u32;
+                reg |= ((config.neg_channels[i] as u8) << (i * 5)) as u32;
             }
             w.bits(reg)
         });
 
         // remaining channels
         if scan_len > deal_len {
-            peripherals.AON.gpadc_reg_scn_pos2.modify(|r,w| {
+            aon.gpadc_reg_scn_pos2.modify(|r,w| {
                 let mut reg = r.bits();
                 for i in 0..scan_len - deal_len {
                     reg = reg & (!(0x1F << (i * 5)));
-                    reg |= ((self.pos_channels[i] as u8) << (i * 5)) as u32;
+                    reg |= ((config.pos_channels[i] as u8) << (i * 5)) as u32;
                 }  
                 w
             });
-            peripherals.AON.gpadc_reg_scn_neg2.modify(|r,w| {
+            aon.gpadc_reg_scn_neg2.modify(|r,w| {
                 let mut reg = r.bits();
                 for i in 0..scan_len - deal_len {
                     reg = reg & (!(0x1F << (i * 5)));
-                    reg |= ((self.neg_channels[i] as u8) << (i * 5)) as u32;
+                    reg |= ((config.neg_channels[i] as u8) << (i * 5)) as u32;
                 }  
                 w
             });
         }
 
         // scan mode
-        peripherals.AON.gpadc_reg_config1.modify(|_,w| unsafe {
+        aon.gpadc_reg_config1.modify(|_,w| unsafe {
             w.gpadc_scan_length().bits(scan_len as u8 - 1u8)
              .gpadc_cont_conv_en().bit(enable_continuous_dma)
              .gpadc_scan_en().bit(true)
         });
     }
 
-    // ADC_FIFO_Cfg
-    fn set_fifo_config(&mut self, fifo_thresh: AdcFifoThreshold, enable_dma: bool) {
-        let peripherals = get_peripherals();
-
-        // enable = Fifo data is exceeded fifoThreshold DMA request occurs
-        // disable = Threshold determines how much data to cause FIFO ready interrupt
-        peripherals.GPIP.gpadc_config.modify(|_,w| unsafe {
-            w.gpadc_fifo_thl().bits(fifo_thresh as u8)
-            .gpadc_dma_en().bit(enable_dma)
-        });
-        // clear fifo
-        peripherals.GPIP.gpadc_config.modify(|_,w| {
-            w.gpadc_fifo_clr().clear_bit()
-        });
-
-        self.fifo_threshold = fifo_thresh;
-        self.fifo_enable_dma = enable_dma;
-    }
-
     // ADC_Gain_Trim
-    fn set_gain_trim(&mut self) { 
+    fn set_gain_trim(coef_enable: &mut bool, coef: &mut u16, coe: &mut f32) { 
         fn get_trim_parity(val: u32, len: u8) -> u8 {
             let mut c: u8 = 0;
 
@@ -512,38 +443,35 @@ impl Adc1
 
         if adc_gain_coeff_en {
             if adc_gain_coeff as u8 == get_trim_parity(adc_gain_coeff_parity, 12) {
-                self.gain_coeff_enable = true; 
-                self.gain_coefficient = adc_gain_coeff as u16;
+                *coef_enable = true; 
+                *coef = adc_gain_coeff as u16;
 
-                let mut tmp = self.gain_coefficient;
+                let mut tmp = *coef;
                 if tmp & 0x800 != 0 {
                     tmp = !tmp;
                     tmp += 1;
                     tmp = tmp & 0xfff;
 
-                    self.gain_coe = 1.0 + (tmp as f32 / 2048.0);
+                    *coe = 1.0 + (tmp as f32 / 2048.0);
                 } else {
-                    self.gain_coe = 1.0 - (tmp as f32 / 2048.0);
+                    *coe = 1.0 - (tmp as f32 / 2048.0);
                 }
             }
         }
     }
 
     pub fn start(&self) {
-        if self.fifo_enable_dma {
-            let dma = get_peripherals().DMA;
+        // disable DMA_INT_ALL
+        let ch1 = self.dma_ch.ch();
+        ch1.ch_config.modify(|_,w| w.itc().set_bit().ie().set_bit());
+        ch1.ch_control.modify(|_,w| w.i().clear_bit());
 
-            // disable DMA_INT_ALL
-            dma.dma_c1config.modify(|_,w| w.itc().set_bit().ie().set_bit());
-            dma.dma_c1control.modify(|_,w| w.i().clear_bit());
+        // enable DMA_INT_TCOMPLETED
+        ch1.ch_config.modify(|_,w| w.itc().clear_bit());
+        ch1.ch_control.modify(|_,w| w.i().set_bit());
 
-            // enable DMA_INT_TCOMPLETED
-            dma.dma_c1config.modify(|_,w| w.itc().clear_bit());
-            dma.dma_c1control.modify(|_,w| w.i().set_bit());
-
-            // enable DMA_INT_ERR
-            dma.dma_c1config.modify(|_,w| w.ie().set_bit());
-        }
+        // enable DMA_INT_ERR
+        ch1.ch_config.modify(|_,w| w.ie().set_bit());
 
         {
             let aon = get_peripherals().AON;
@@ -552,48 +480,45 @@ impl Adc1
             aon.gpadc_reg_cmd.modify(|_,w| w.gpadc_conv_start().set_bit());
         }
 
-        if self.fifo_enable_dma {
-            // Enable DMA
-            adc_enable(true);
+        adc_enable(true);
 
+        {
             let dma = get_peripherals().DMA;
             dma.dma_top_config.modify(|_,w| w.e().set_bit());
-            // DMA channel 1 = ADC_CHANNEL
-            dma.dma_c1config.modify(|_,w| w.e().set_bit());
+
         }
+
+        // DMA channel 1 = ADC_CHANNEL
+        ch1.ch_config.modify(|_,w| w.e().set_bit());
     }
 
     pub fn stop(&self) {
         get_peripherals().AON.gpadc_reg_cmd.modify(|_,w| w.gpadc_conv_start().set_bit());
-
-        if self.fifo_enable_dma {
-            // DMA channel 1 = ADC_CHANNEL
-            get_peripherals().DMA.dma_top_config.modify(|_,w| w.e().clear_bit());
-        }
+        get_peripherals().DMA.dma_top_config.modify(|_,w| w.e().clear_bit());
     }
 
     pub fn fifo_count(&self) -> u8 {
-        get_peripherals().GPIP.gpadc_config.read().gpadc_fifo_data_count().bits()
+        self.gpip.gpadc_config.read().gpadc_fifo_data_count().bits()
     }
 
     pub fn fifo_full(&self) -> bool {
-        get_peripherals().GPIP.gpadc_config.read().gpadc_fifo_full().bit()
+        self.gpip.gpadc_config.read().gpadc_fifo_full().bit()
     }
 
     pub fn fifo_empty(&self) -> bool {
-        get_peripherals().GPIP.gpadc_config.read().gpadc_fifo_ne().bit() == false
+        self.gpip.gpadc_config.read().gpadc_fifo_ne().bit() == false
     }
 
-    pub fn set_gain(&mut self, gain1: AdcPgaGain, gain2: AdcPgaGain) {
+    fn set_gain(config: &Config) {
         let aon = unsafe { &*pac::AON::ptr() };
         aon.gpadc_reg_config2.modify(|_, w| unsafe {
             w.gpadc_dly_sel().bits(0u8);
-            w.gpadc_pga1_gain().bits(self.gain1 as u8);
-            w.gpadc_pga2_gain().bits(self.gain2 as u8);
-            w.gpadc_bias_sel().bit(self.bias_sel.into());
+            w.gpadc_pga1_gain().bits(config.gain1 as u8);
+            w.gpadc_pga2_gain().bits(config.gain2 as u8);
+            w.gpadc_bias_sel().bit(config.bias_sel.into());
 
             // chopmode
-            let has_gain = self.gain1 != AdcPgaGain::PgaGainNone || self.gain2 != AdcPgaGain::PgaGainNone;
+            let has_gain = config.gain1 != AdcPgaGain::PgaGainNone || config.gain2 != AdcPgaGain::PgaGainNone;
             if has_gain {
                 w.gpadc_chop_mode().bits(2u8);
             } else {
@@ -606,94 +531,33 @@ impl Adc1
 
             // pga_os_cal = mic
             w.gpadc_pga_os_cal().bits(8u8);
-            w.gpadc_pga_vcm().bits(self.vcm as u8);
-            w.gpadc_vref_sel().bit(self.vref.into());
-            w.gpadc_diff_mode().bit(self.input_mode.into());
+            w.gpadc_pga_vcm().bits(config.vcm as u8);
+            w.gpadc_vref_sel().bit(config.vref.into());
+            w.gpadc_diff_mode().bit(config.input_mode.into());
 
             w
         });
 
         // calibration offset
         aon.gpadc_reg_define.modify(|_,w| unsafe {
-            w.gpadc_os_cal_data().bits(self.offset_calibration_value)
+            w.gpadc_os_cal_data().bits(config.offset_calibration_value)
         });
-
-        self.gain1 = gain1;
-        self.gain2 = gain2;
     }
 
-    pub fn dma_init(&mut self, sample_len: u32) {
-        let mut ctx = AdcContext {
-            channel_data: 0,
-            chan_init_table: 0,
-            data_size: sample_len,
-            data_buf: [0u8; ADC_DMA_BUF_SIZE],
-            lli0: DmaLliCtrl {
-                src_dma_addr: 0x40002000+0x4,
-                dst_dma_addr: null(),
-                next_lli: null(),
-            },
-            lli1: DmaLliCtrl {
-                src_dma_addr: 0x40002000+0x4,
-                dst_dma_addr: null(),
-                next_lli: null(),
-            },
-        };
-        ctx.lli0.next_lli = &ctx.lli1;
-        ctx.lli1.next_lli = &ctx.lli0;
-        ctx.lli0.dst_dma_addr = core::ptr::addr_of!(ctx.data_buf[0]);
-        ctx.lli1.dst_dma_addr = core::ptr::addr_of!(ctx.data_buf[ADC_CHANNEL_COUNT]);
-
-        // ADC_DMA_CHANNEL = 1
-        dma_channel_disable(1);
-
-        {
-            let dma = get_peripherals().DMA;
-            dma.dma_c1config.modify(|_,w| unsafe {
-                w.flow_cntrl().bits(DmaTransferDir::PeripheralToMemory as u8)
-                 .dst_peripheral().bits(0u8)  // 0 = DMA_REQ_NONE
-                 .src_peripheral().bits(22u8) // 22 = DMA_REQ_GPADC0
-            });
-            dma.dma_c1control.modify(|_,w| unsafe {
-                w.transfer_size().bits(sample_len as u16)
-                // 1 = DMA_BURST_SIZE_1, 2 = 4, 3 = 8, 4 = 16
-                .sbsize().bits(1) 
-                .dbsize().bits(1)
-                .swidth().bits(2u8) // 0 = 8bit, 1 = 16, 32 = 2
-                .dwidth().bits(2u8)
-                .si().clear_bit()
-                .di().set_bit()
-                .i().set_bit()
-                .prot().bits(0u8)
-            });
-
-            // DMA_LLI_Update
-            {
-                let lli0_ptr = core::ptr::addr_of!(ctx.lli0) as u32;
-                dma.dma_c0lli.modify(|_,w| unsafe { w.lli().bits(lli0_ptr) });
-            }
-        }
-
-        // bl_dma_irq_register
-
-    }
 }
 
-impl<WORD, PIN> OneShot<Adc1, WORD, PIN> for Adc1
+impl<WORD, PIN> OneShot<Adc, WORD, PIN> for Adc
 where WORD: From<u16>,
-      PIN: Channel<Adc1, ID=AdcChannel>,
+      PIN: Channel<Adc, ID=AdcChannel>,
 {
     type Error = AdcError;
 
     fn read(&mut self, pin: &mut PIN) -> nb::Result<WORD, Self::Error> {
-        let channel = pin.channel();
+        let _adc_channel = pin.channel();
 
         self.start();
-        while self.fifo_count() == 0 {
-            return Err(nb::Error::Other(AdcError::ErrFifoEmpty));
-        }
 
-        let adc_val = get_peripherals().GPIP.gpadc_dma_rdata.read().bits() as u16;
+        let adc_val = self.gpip.gpadc_dma_rdata.read().bits() as u16;
         if adc_val == 0 {
             return Err(nb::Error::Other(AdcError::ErrRead));
         }
@@ -702,23 +566,25 @@ where WORD: From<u16>,
     }
 }
 
-#[inline]
-fn get_peripherals() -> Peripherals {
-    // TODO: take is locking for some reason, resort to more nefarious programming
-    unsafe { pac::Peripherals::steal() }
+impl dma::ReadTarget for Adc {
+    type ReceivedWord = u16;
+
+    fn rx_address_count(&self) -> (u32, u32) {
+        (self.gpip.gpadc_dma_rdata.as_ptr() as u32, u32::MAX)
+    }
+    fn rx_treq() -> Option<u8> {
+        // ??
+        Some(0)
+    }
+    fn rx_increment(&self) -> bool {
+        false
+    }
 }
 
-
-// DMA_Channel_Disable
-fn dma_channel_disable(channel: u8)
-{
-    match channel {
-        0 => get_peripherals().DMA.dma_c0config.modify(|_,w| w.e().clear_bit()),
-        1 => get_peripherals().DMA.dma_c1config.modify(|_,w| w.e().clear_bit()),
-        2 => get_peripherals().DMA.dma_c2config.modify(|_,w| w.e().clear_bit()),
-        3 => get_peripherals().DMA.dma_c3config.modify(|_,w| w.e().clear_bit()),
-        _ => panic!(),
-    }
+#[inline]
+fn get_peripherals() -> Peripherals {
+    // TODO: Don't do this
+    unsafe { pac::Peripherals::steal() }
 }
 
 fn soft_reset()

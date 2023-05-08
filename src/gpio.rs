@@ -243,6 +243,8 @@ pub struct Adc;
 pub trait UartPin<SIG> {}
 
 // There are Pin0 to Pin22, totally 23 pins
+#[doc(hidden)]
+pub trait AdcPin<ADC> {}
 
 pub use self::pin::*;
 
@@ -351,7 +353,6 @@ macro_rules! impl_glb {
 
                 /// Configures the pin to operate as an ADC pin
                 pub fn into_adc(self) -> $Pini<Adc> {
-                    // 10 -> ADC_FUNC_ANALOG
                     self.into_pin_with_mode(10, false, false, true)
                 }
 
